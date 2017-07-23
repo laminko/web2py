@@ -11,7 +11,7 @@ HTTP statuses helpers
 """
 
 import re
-from gluon._compat import iteritems
+from gluon._compat import iteritems, unicodeT
 
 __all__ = ['HTTP', 'redirect']
 
@@ -116,12 +116,14 @@ class HTTP(Exception):
         for k, v in iteritems(headers):
             if isinstance(v, list):
                 rheaders += [(k, str(item)) for item in v]
-            elif not v is None:
+            elif v is not None:
                 rheaders.append((k, str(v)))
         responder(status, rheaders)
         if env.get('request_method', '') == 'HEAD':
             return ['']
         elif isinstance(body, (str, bytes, bytearray)):
+            if isinstance(body, unicodeT):
+                body = body.encode('utf-8')
             return [body]
         elif hasattr(body, '__iter__'):
             return body
@@ -148,7 +150,7 @@ class HTTP(Exception):
             web2py_error=self.headers.get('web2py_error'))
 
     def __str__(self):
-        "stringify me"
+        """stringify me"""
         return self.message
 
 

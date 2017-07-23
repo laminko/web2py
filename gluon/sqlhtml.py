@@ -29,7 +29,7 @@ from gluon.html import URL, FIELDSET, P, DEFAULT_PASSWORD_DISPLAY
 from pydal.base import DEFAULT
 from pydal.objects import Table, Row, Expression, Field, Set, Rows
 from pydal.adapters.base import CALLABLETYPES
-from pydal.helpers.methods import smart_query, bar_encode,  _repr_ref
+from pydal.helpers.methods import smart_query, bar_encode, _repr_ref, merge_tablemaps
 from pydal.helpers.classes import Reference, SQLCustomType
 from gluon.storage import Storage
 from gluon.utils import md5_hash
@@ -405,7 +405,7 @@ class RadioWidget(OptionsWidget):
         cols = attributes.get('cols', 1)
         totals = len(options)
         mods = totals % cols
-        rows = totals / cols
+        rows = totals // cols
         if mods:
             rows += 1
 
@@ -471,7 +471,7 @@ class CheckboxesWidget(OptionsWidget):
         cols = attributes.get('cols', 1)
         totals = len(options)
         mods = totals % cols
-        rows = totals / cols
+        rows = totals // cols
         if mods:
             rows += 1
 
@@ -684,9 +684,10 @@ class AutocompleteWidget(object):
             urlvars = request.vars
             urlvars[default_var] = 1
             self.url = URL(args=request.args, vars=urlvars)
-            self.callback()
+            self.run_callback = True
         else:
             self.url = request
+            self.run_callback = False
 
     def callback(self):
         if self.keyword in self.request.vars:
@@ -759,6 +760,8 @@ class AutocompleteWidget(object):
                 raise HTTP(200, '')
 
     def __call__(self, field, value, **attributes):
+        if self.run_callback:
+            self.callback()
         default = dict(
             _type='text',
             value=(value is not None and str(value)) or '',
@@ -1916,7 +1919,7 @@ class SQLFORM(FORM):
         if 'table_name' in attributes:
             del attributes['table_name']
 
-        return SQLFORM(DAL(None).define_table(table_name, *fields),
+        return SQLFORM(DAL(None).define_table(table_name, *[field.clone() for field in fields]),
                        **attributes)
 
     @staticmethod
@@ -2153,7 +2156,8 @@ class SQLFORM(FORM):
              ignore_common_filters=None,
              auto_pagination=True,
              use_cursor=False,
-             represent_none=None):
+             represent_none=None,
+             showblobs=False):
 
         formstyle = formstyle or current.response.formstyle
         if isinstance(query, Set):
@@ -2194,7 +2198,7 @@ class SQLFORM(FORM):
                       buttondelete='icon trash icon-trash glyphicon glyphicon-trash',
                       buttonedit='icon pen icon-pencil glyphicon glyphicon-pencil',
                       buttontable='icon rightarrow icon-arrow-right glyphicon glyphicon-arrow-right',
-                      buttonview='icon magnifier icon-zoom-in glyphicon glyphicon-zoom-in',
+                      buttonview='icon magnifier icon-zoom-in glyphicon glyphicon-zoom-in'
                       )
         elif not isinstance(ui, dict):
             raise RuntimeError('SQLFORM.grid ui argument must be a dictionary')
@@ -2328,7 +2332,7 @@ class SQLFORM(FORM):
             if not isinstance(left, (list, tuple)):
                 left = [left]
             for join in left:
-                tablenames += db._adapter.tables(join)
+                tablenames = merge_tablemaps(tablenames, db._adapter.tables(join))
         tables = [db[tablename] for tablename in tablenames]
         if fields:
             # add missing tablename to virtual fields
@@ -2340,7 +2344,7 @@ class SQLFORM(FORM):
         else:
             fields = []
             columns = []
-            filter1 = lambda f: isinstance(f, Field) and f.type != 'blob'
+            filter1 = lambda f: isinstance(f, Field) and (f.type!='blob' or showblobs)
             filter2 = lambda f: isinstance(f, Field) and f.readable
             for table in tables:
                 fields += filter(filter1, table)
@@ -2553,6 +2557,7 @@ class SQLFORM(FORM):
                         if isinstance(field, Field.Virtual) and not str(field) in expcolumns:
                             expcolumns.append(str(field))
 
+            expcolumns = ['"%s"' % '"."'.join(f.split('.')) for f in expcolumns]
             if export_type in exportManager and exportManager[export_type]:
                 if keywords:
                     try:
@@ -2862,7 +2867,7 @@ class SQLFORM(FORM):
                 for field in columns:
                     if not field.readable:
                         continue
-                    if field.type == 'blob':
+                    elif field.type == 'blob' and not showblobs:
                         continue
                     if isinstance(field, Field.Virtual) and field.tablename in row:
                         try:
@@ -3150,7 +3155,9 @@ class SQLFORM(FORM):
                 # if isinstance(linked_tables, dict):
                 #     linked_tables = linked_tables.get(table._tablename, [])
                 if linked_tables is None or referee in linked_tables:
-                    field.represent = lambda id, r=None, referee=referee, rep=field.represent: A(callable(rep) and rep(id) or id, cid=request.cid, _href=url(args=['view', referee, id]))
+                    field.represent = (lambda id, r=None, referee=referee, rep=field.represent: 
+                                       A(callable(rep) and rep(id) or id, 
+                                         cid=request.cid, _href=url(args=['view', referee, id])))
         except (KeyError, ValueError, TypeError):
             redirect(URL(args=table._tablename))
         if nargs == len(args) + 1:
@@ -3311,23 +3318,28 @@ class SQLTABLE(TABLE):
         if not sqlrows:
             return
         REGEX_TABLE_DOT_FIELD = sqlrows.db._adapter.REGEX_TABLE_DOT_FIELD
+        fieldmap = dict(zip(sqlrows.colnames, sqlrows.fields))
+        tablemap = dict(((f.tablename, f.table) for f in fieldmap.values()))
+        for table in tablemap.values():
+            pref = table._tablename + '.'
+            fieldmap.update(((pref+f.name, f) for f in table._virtual_fields))
+            fieldmap.update(((pref+f.name, f) for f in table._virtual_methods))
+        field_types = (Field, Field.Virtual, Field.Method)
         if not columns:
             columns = list(sqlrows.colnames)
-        if headers == 'fieldname:capitalize':
+        header_func = {
+            'fieldname:capitalize': lambda f: f.name.replace('_', ' ').title(),
+            'labels': lambda f: f.label
+        }
+        if isinstance(headers, str) and headers in header_func:
+            make_name = header_func[headers]
             headers = {}
             for c in columns:
-                tfmatch = REGEX_TABLE_DOT_FIELD.match(c)
-                if tfmatch:
-                    (t, f) = REGEX_TABLE_DOT_FIELD.match(c).groups()
-                    headers[t + '.' + f] = f.replace('_', ' ').title()
+                f = fieldmap.get(c)
+                if isinstance(f, field_types):
+                    headers[c] = make_name(f)
                 else:
                     headers[c] = REGEX_ALIAS_MATCH.sub(r'\2', c)
-        elif headers == 'labels':
-            headers = {}
-            for c in columns:
-                (t, f) = c.split('.')
-                field = sqlrows.db[t][f]
-                headers[c] = field.label
         if colgroup:
             cols = [COL(_id=c.replace('.', '-'), data={'column': i + 1})
                     for i, c in enumerate(columns)]
@@ -3380,9 +3392,8 @@ class SQLTABLE(TABLE):
                     _class += ' rowselected'
 
             for colname in columns:
-                matched_column_field = \
-                    sqlrows.db._adapter.REGEX_TABLE_DOT_FIELD.match(colname)
-                if not matched_column_field:
+                field = fieldmap.get(colname)
+                if not isinstance(field, field_types):
                     if "_extra" in record and colname in record._extra:
                         r = record._extra[colname]
                         row.append(TD(r))
@@ -3390,12 +3401,9 @@ class SQLTABLE(TABLE):
                     else:
                         raise KeyError(
                             "Column %s not found (SQLTABLE)" % colname)
-                (tablename, fieldname) = matched_column_field.groups()
-                colname = tablename + '.' + fieldname
-                try:
-                    field = sqlrows.db[tablename][fieldname]
-                except (KeyError, AttributeError):
-                    field = None
+                # Virtual fields don't have parent table name...
+                tablename = colname.split('.', 1)[0]
+                fieldname = field.name
                 if tablename in record \
                         and isinstance(record, Row) \
                         and isinstance(record[tablename], Row):

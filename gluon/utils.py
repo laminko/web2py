@@ -17,6 +17,7 @@ import random
 import inspect
 import time
 import os
+import sys
 import re
 import logging
 import socket
@@ -155,12 +156,12 @@ def get_digest(value):
         raise ValueError("Invalid digest algorithm: %s" % value)
 
 DIGEST_ALG_BY_SIZE = {
-    128 / 4: 'md5',
-    160 / 4: 'sha1',
-    224 / 4: 'sha224',
-    256 / 4: 'sha256',
-    384 / 4: 'sha384',
-    512 / 4: 'sha512',
+    128 // 4: 'md5',
+    160 // 4: 'sha1',
+    224 // 4: 'sha224',
+    256 // 4: 'sha256',
+    384 // 4: 'sha384',
+    512 // 4: 'sha512',
 }
 
 
@@ -299,19 +300,20 @@ def initialize_urandom():
     try:
         os.urandom(1)
         have_urandom = True
-        try:
-            # try to add process-specific entropy
-            frandom = open('/dev/urandom', 'wb')
+        if sys.platform != 'win32':
             try:
-                if PY2:
-                    frandom.write(''.join(chr(t) for t in ctokens))
-                else:
-                    frandom.write(bytes([]).join(bytes([t]) for t in ctokens))
-            finally:
-                frandom.close()
-        except IOError:
-            # works anyway
-            pass
+                # try to add process-specific entropy
+                frandom = open('/dev/urandom', 'wb')
+                try:
+                    if PY2:
+                        frandom.write(''.join(chr(t) for t in ctokens))
+                    else:
+                        frandom.write(bytes([]).join(bytes([t]) for t in ctokens))
+                finally:
+                    frandom.close()
+            except IOError:
+                # works anyway
+                pass
     except NotImplementedError:
         have_urandom = False
         logger.warning(
