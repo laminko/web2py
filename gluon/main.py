@@ -1,4 +1,3 @@
-#!/bin/env python
 # -*- coding: utf-8 -*-
 
 """
@@ -9,10 +8,9 @@
 The gluon wsgi application
 ---------------------------
 """
-from __future__ import print_function
 
 if False:
-    import import_all  # DO NOT REMOVE PART OF FREEZE PROCESS
+    from . import import_all  # DO NOT REMOVE PART OF FREEZE PROCESS
 import gc
 
 import os
@@ -26,13 +24,13 @@ import socket
 import random
 import string
 
-from gluon._compat import Cookie, urllib2
+from gluon._compat import Cookie, urllib_quote
 # from thread import allocate_lock
 
-from gluon.fileutils import abspath, write_file
+from gluon.fileutils import abspath, read_file, write_file, create_missing_folders, create_missing_app_folders, \
+    add_path_first
 from gluon.settings import global_settings
-from gluon.utils import web2py_uuid
-from gluon.admin import add_path_first, create_missing_folders, create_missing_app_folders
+from gluon.utils import web2py_uuid, unlocalised_http_header_date
 from gluon.globals import current
 
 #  Remarks:
@@ -56,7 +54,6 @@ web2py_path = global_settings.applications_parent  # backward compatibility
 create_missing_folders()
 
 # set up logging for subsequent imports
-import logging
 import logging.config
 
 # This needed to prevent exception on Python 2.5:
@@ -100,13 +97,9 @@ requests = 0    # gc timer
 # Security Checks: validate URL and session_id here,
 # accept_language is validated in languages
 
-# pattern used to validate client address
-regex_client = re.compile('[\w\-:]+(\.[\w\-]+)*\.?')  # ## to account for IPV6
-
 try:
-    version_info = open(pjoin(global_settings.gluon_parent, 'VERSION'), 'r')
-    raw_version_string = version_info.read().split()[-1].strip()
-    version_info.close()
+    version_info = read_file(pjoin(global_settings.gluon_parent, 'VERSION'))
+    raw_version_string = version_info.split()[-1].strip()
     global_settings.web2py_version = raw_version_string
     web2py_version = global_settings.web2py_version
 except:
@@ -123,6 +116,9 @@ load_routes()
 HTTPS_SCHEMES = set(('https', 'HTTPS'))
 
 
+# pattern used to match client IP address
+REGEX_CLIENT = re.compile(r'[\w:]+(\.\w+)*')
+
 def get_client(env):
     """
     Guesses the client address from the environment variables
@@ -131,12 +127,12 @@ def get_client(env):
     if all fails, assume '127.0.0.1' or '::1' (running locally)
     """
     eget = env.get
-    g = regex_client.search(eget('http_x_forwarded_for', ''))
-    client = (g.group() or '').split(',')[0] if g else None
+    m = REGEX_CLIENT.search(eget('http_x_forwarded_for', ''))
+    client = m and m.group()
     if client in (None, '', 'unknown'):
-        g = regex_client.search(eget('remote_addr', ''))
-        if g:
-            client = g.group()
+        m = REGEX_CLIENT.search(eget('remote_addr', ''))
+        if m:
+            client = m.group()
         elif env.http_host.startswith('['):  # IPv6
             client = '::1'
         else:
@@ -183,12 +179,13 @@ def serve_controller(request, response, session):
         response._view_environment.update(page)
         page = run_view_in(response._view_environment)
 
-    # logic to garbage collect after exec, not always, once every 100 requests
-    global requests
-    requests = ('requests' in globals()) and (requests + 1) % 100 or 0
-    if not requests:
-        gc.collect()
-    # end garbage collection logic
+    if not request.env.web2py_disable_garbage_collect:
+        # logic to garbage collect after exec, not always, once every 100 requests
+        global requests
+        requests = ('requests' in globals()) and (requests + 1) % 100 or 0
+        if not requests:
+            gc.collect()
+        # end garbage collection logic
 
     # ##################################################
     # set default headers it not set
@@ -198,8 +195,7 @@ def serve_controller(request, response, session):
         ('Content-Type', contenttype('.' + request.extension)),
         ('Cache-Control',
          'no-store, no-cache, must-revalidate, post-check=0, pre-check=0'),
-        ('Expires', time.strftime('%a, %d %b %Y %H:%M:%S GMT',
-                                  time.gmtime())),
+        ('Expires', unlocalised_http_header_date(time.gmtime())),
         ('Pragma', 'no-cache')]
     for key, value in default_headers:
         response.headers.setdefault(key, value)
@@ -231,7 +227,7 @@ class LazyWSGI(object):
 
         to call third party WSGI applications
         """
-        self.response.status = str(status).split(' ', 1)[0]
+        self.response.status = int(str(status).split(' ', 1)[0])
         self.response.headers = dict(headers)
         return lambda *args, **kargs: \
             self.response.write(escape=False, *args, **kargs)
@@ -249,7 +245,7 @@ class LazyWSGI(object):
             def app(environ, start_response):
                 data = f()
                 start_response(self.response.status,
-                               self.response.headers.items())
+                               list(self.response.headers.items()))
                 if isinstance(data, list):
                     return data
                 return [data]
@@ -354,11 +350,10 @@ def wsgibase(environ, responder):
                     local_hosts = global_settings.local_hosts
                 client = get_client(env)
                 x_req_with = str(env.http_x_requested_with).lower()
-                cmd_opts = global_settings.cmd_options
 
                 request.update(
                     client=client,
-                    folder=abspath('applications', app) + os.sep,
+                    folder=abspath('applications', app),
                     ajax=x_req_with == 'xmlhttprequest',
                     cid=env.http_web2py_component_element,
                     is_local=(env.remote_addr in local_hosts and client == env.remote_addr),
@@ -391,7 +386,7 @@ def wsgibase(environ, responder):
                 elif not request.is_local and exists(disabled):
                     five0three = os.path.join(request.folder, 'static', '503.html')
                     if os.path.exists(five0three):
-                        raise HTTP(503, file(five0three, 'r').read())
+                        raise HTTP(503, open(five0three, 'r').read())
                     else:
                         raise HTTP(503, "<html><body><h1>Temporarily down for maintenance</h1></body></html>")
 
@@ -486,10 +481,10 @@ def wsgibase(environ, responder):
                     if request.ajax:
                         if response.flash:
                             http_response.headers['web2py-component-flash'] = \
-                                urllib2.quote(xmlescape(response.flash).replace(b'\n', b''))
+                                urllib_quote(xmlescape(response.flash).replace(b'\n', b''))
                         if response.js:
                             http_response.headers['web2py-component-command'] = \
-                                urllib2.quote(response.js.replace('\n', ''))
+                                urllib_quote(response.js.replace('\n', ''))
 
                     # ##################################################
                     # store cookies in headers
@@ -559,8 +554,12 @@ def wsgibase(environ, responder):
         http_response, request, environ, ticket)
     if not http_response:
         return wsgibase(new_environ, responder)
+
     if global_settings.web2py_crontype == 'soft':
-        newcron.softcron(global_settings.applications_parent).start()
+        cmd_opts = global_settings.cmd_options
+        newcron.softcron(global_settings.applications_parent,
+                         apps=cmd_opts and cmd_opts.crontabs)
+
     return http_response.to(responder, env=env)
 
 
@@ -713,13 +712,12 @@ class HttpServer(object):
         if interfaces:
             # if interfaces is specified, it must be tested for rocket parameter correctness
             # not necessarily completely tested (e.g. content of tuples or ip-format)
-            import types
             if isinstance(interfaces, list):
                 for i in interfaces:
                     if not isinstance(i, tuple):
-                        raise "Wrong format for rocket interfaces parameter - see http://packages.python.org/rocket/"
+                        raise AttributeError("Wrong format for rocket interfaces parameter - see http://packages.python.org/rocket/")
             else:
-                raise "Wrong format for rocket interfaces parameter - see http://packages.python.org/rocket/"
+                raise AttributeError("Wrong format for rocket interfaces parameter - see http://packages.python.org/rocket/")
 
         if path:
             # if a path is specified change the global variables so that web2py
@@ -745,7 +743,7 @@ class HttpServer(object):
         sock_list = [ip, port]
         if not ssl_certificate or not ssl_private_key:
             logger.info('SSL is off')
-        elif not rocket.ssl:
+        elif not rocket.has_ssl:
             logger.warning('Python "ssl" module unavailable. SSL is OFF')
         elif not exists(ssl_certificate):
             logger.warning('unable to open SSL certificate. SSL is OFF')
@@ -766,8 +764,8 @@ class HttpServer(object):
                                     app_info=app_info,
                                     min_threads=min_threads,
                                     max_threads=max_threads,
-                                    queue_size=int(request_queue_size),
-                                    timeout=int(timeout),
+                                    queue_size=request_queue_size,
+                                    timeout=timeout,
                                     handle_signals=False,
                                     )
 
@@ -787,7 +785,11 @@ class HttpServer(object):
         """
         stop cron and the web server
         """
-        newcron.stopcron()
+        if global_settings.web2py_crontype == 'soft':
+            try:
+                newcron.stopcron()
+            except:
+                pass
         self.server.stop(stoplogging)
         try:
             os.unlink(self.pid_filename)

@@ -158,10 +158,10 @@ class testResponse(unittest.TestCase):
         response.files.append(URL('a', 'static', 'css/file.ts'))
         content = return_includes(response)
         self.assertEqual(content,
+                         '<script src="http://maps.google.com/maps/api/js?sensor=false" type="text/javascript"></script>' +
                          '<script src="https://code.jquery.com/jquery-1.11.3.min.js?var=0" type="text/javascript"></script>' +
                          '<link href="/a/static/css/file.css" rel="stylesheet" type="text/css" />' +
-                         '<script src="/a/static/css/file.ts" type="text/typescript"></script>' +
-                         '<script src="http://maps.google.com/maps/api/js?sensor=false" type="text/javascript"></script>'
+                         '<script src="/a/static/css/file.ts" type="text/typescript"></script>'
                          )
 
         response = Response()
@@ -230,3 +230,32 @@ class testResponse(unittest.TestCase):
         current.session._fixup_before_save()
         cookie = str(current.response.cookies)
         self.assertTrue('httponly' not in cookie.lower())
+
+    def test_cookies_samesite(self):
+        # Test Lax is the default mode
+        current = setup_clean_session()
+        current.session._fixup_before_save()
+        cookie = str(current.response.cookies)
+        self.assertTrue('samesite=lax' in cookie.lower())
+        # Test you can disable samesite
+        current = setup_clean_session()
+        current.session.samesite(False)
+        current.session._fixup_before_save()
+        cookie = str(current.response.cookies)
+        self.assertTrue('samesite' not in cookie.lower())
+        # Test you can change mode
+        current = setup_clean_session()
+        current.session.samesite('Strict')
+        current.session._fixup_before_save()
+        cookie = str(current.response.cookies)
+        self.assertTrue('samesite=strict' in cookie.lower())
+
+    def test_include_meta(self):
+        response = Response()
+        response.meta['web2py'] = 'web2py'
+        response.include_meta()
+        self.assertEqual(response.body.getvalue(), '\n<meta name="web2py" content="web2py" />\n')
+        response = Response()
+        response.meta['meta_dict'] = {'tag_name':'tag_value'}
+        response.include_meta()
+        self.assertEqual(response.body.getvalue(), '\n<meta tag_name="tag_value" />\n')

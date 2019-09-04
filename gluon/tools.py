@@ -12,11 +12,12 @@ Auth, Mail, PluginManager and various utilities
 
 import base64
 from functools import reduce
-from gluon._compat import pickle, thread, urllib2, Cookie, StringIO
+from gluon._compat import pickle, thread, urllib2, Cookie, StringIO, urlencode
 from gluon._compat import configparser, MIMEBase, MIMEMultipart, MIMEText, Header
 from gluon._compat import Encoders, Charset, long, urllib_quote, iteritems
-from gluon._compat import to_bytes, to_native, add_charset
+from gluon._compat import to_bytes, to_native, add_charset, string_types
 from gluon._compat import charset_QP, basestring, unicodeT, to_unicode
+from gluon._compat import urllib2, urlopen
 import datetime
 import logging
 import sys
@@ -27,7 +28,6 @@ import time
 import fnmatch
 import traceback
 import smtplib
-import urllib
 import email.utils
 import random
 import hmac
@@ -53,7 +53,7 @@ import gluon.serializers as serializers
 Table = DAL.Table
 Field = DAL.Field
 
-__all__ = ['Mail', 'Auth', 'Recaptcha', 'Recaptcha2', 'Crud', 'Service', 'Wiki',
+__all__ = ['Mail', 'Auth', 'Recaptcha2', 'Crud', 'Service', 'Wiki',
            'PluginManager', 'fetch', 'geocode', 'reverse_geocode', 'prettydate']
 
 # mind there are two loggers here (logger and crud.settings.logger)!
@@ -776,7 +776,9 @@ class Mail(object):
                 if attachments:
                     result = mail.send_mail(
                         sender=sender, to=origTo,
-                        subject=to_unicode(subject, encoding), body=to_unicode(text or '', encoding), html=html,
+                        subject=to_unicode(subject, encoding),
+                        body=to_unicode(text or '', encoding),
+                        html=html,
                         attachments=attachments, **xcc)
                 elif html and (not raw):
                     result = mail.send_mail(
@@ -786,6 +788,20 @@ class Mail(object):
                     result = mail.send_mail(
                         sender=sender, to=origTo,
                         subject=to_unicode(subject, encoding), body=to_unicode(text or '', encoding), **xcc)
+            elif self.settings.server == 'aws':
+                import boto3
+                from botocore.exceptions import ClientError
+                client = boto3.client('ses')
+                try:
+                    raw = {'Data': payload.as_string()}
+                    response = client.send_raw_email(RawMessage=raw,
+                                                     Source=sender,
+                                                     Destinations=to)
+                    return True
+                except ClientError as e:
+                    # we should log this error:
+                    # print e.response['Error']['Message']
+                    return False
             else:
                 smtp_args = self.settings.server.split(':')
                 kwargs = dict(timeout=self.settings.timeout)
@@ -809,149 +825,6 @@ class Mail(object):
         self.result = result
         self.error = None
         return True
-
-
-class Recaptcha(DIV):
-
-    """
-    Examples:
-        Use as::
-
-            form = FORM(Recaptcha(public_key='...', private_key='...'))
-
-        or::
-
-            form = SQLFORM(...)
-            form.append(Recaptcha(public_key='...', private_key='...'))
-
-    """
-
-    API_SSL_SERVER = 'https://www.google.com/recaptcha/api'
-    API_SERVER = 'http://www.google.com/recaptcha/api'
-    VERIFY_SERVER = 'http://www.google.com/recaptcha/api/verify'
-
-    def __init__(self,
-                 request=None,
-                 public_key='',
-                 private_key='',
-                 use_ssl=False,
-                 error=None,
-                 error_message='invalid',
-                 label='Verify:',
-                 options='',
-                 comment='',
-                 ajax=False
-                 ):
-        request = request or current.request
-        self.request_vars = request and request.vars or current.request.vars
-        self.remote_addr = request.env.remote_addr
-        self.public_key = public_key
-        self.private_key = private_key
-        self.use_ssl = use_ssl
-        self.error = error
-        self.errors = Storage()
-        self.error_message = error_message
-        self.components = []
-        self.attributes = {}
-        self.label = label
-        self.options = options
-        self.comment = comment
-        self.ajax = ajax
-
-    def _validate(self):
-
-        # for local testing:
-
-        recaptcha_challenge_field = \
-            self.request_vars.recaptcha_challenge_field
-        recaptcha_response_field = \
-            self.request_vars.recaptcha_response_field
-        private_key = self.private_key
-        remoteip = self.remote_addr
-        if not (recaptcha_response_field and recaptcha_challenge_field
-                and len(recaptcha_response_field)
-                and len(recaptcha_challenge_field)):
-            self.errors['captcha'] = self.error_message
-            return False
-        params = urllib.urlencode({
-            'privatekey': private_key,
-            'remoteip': remoteip,
-            'challenge': recaptcha_challenge_field,
-            'response': recaptcha_response_field,
-        })
-        request = urllib2.Request(
-            url=self.VERIFY_SERVER,
-            data=params,
-            headers={'Content-type': 'application/x-www-form-urlencoded',
-                     'User-agent': 'reCAPTCHA Python'})
-        httpresp = urllib2.urlopen(request)
-        return_values = httpresp.read().splitlines()
-        httpresp.close()
-        return_code = return_values[0]
-        if return_code == 'true':
-            del self.request_vars.recaptcha_challenge_field
-            del self.request_vars.recaptcha_response_field
-            self.request_vars.captcha = ''
-            return True
-        else:
-            # In case we get an error code, store it so we can get an error message
-            # from the /api/challenge URL as described in the reCAPTCHA api docs.
-            self.error = return_values[1]
-            self.errors['captcha'] = self.error_message
-            return False
-
-    def xml(self):
-        public_key = self.public_key
-        use_ssl = self.use_ssl
-        error_param = ''
-        if self.error:
-            error_param = '&error=%s' % self.error
-        if use_ssl:
-            server = self.API_SSL_SERVER
-        else:
-            server = self.API_SERVER
-        if not self.ajax:
-            captcha = DIV(
-                SCRIPT("var RecaptchaOptions = {%s};" % self.options),
-                SCRIPT(_type="text/javascript",
-                       _src="%s/challenge?k=%s%s" % (server, public_key, error_param)),
-                TAG.noscript(
-                    IFRAME(
-                        _src="%s/noscript?k=%s%s" % (
-                            server, public_key, error_param),
-                        _height="300", _width="500", _frameborder="0"), BR(),
-                    INPUT(
-                        _type='hidden', _name='recaptcha_response_field',
-                        _value='manual_challenge')), _id='recaptcha')
-
-        else:  # use Google's ajax interface, needed for LOADed components
-
-            url_recaptcha_js = "%s/js/recaptcha_ajax.js" % server
-            RecaptchaOptions = "var RecaptchaOptions = {%s}" % self.options
-            script = """%(options)s;
-            jQuery.getScript('%(url)s',function() {
-                Recaptcha.create('%(public_key)s',
-                    'recaptcha',jQuery.extend(RecaptchaOptions,{'callback':Recaptcha.focus_response_field}))
-                }) """ % ({'options': RecaptchaOptions, 'url': url_recaptcha_js, 'public_key': public_key})
-            captcha = DIV(
-                SCRIPT(
-                    script,
-                    _type="text/javascript",
-                ),
-                TAG.noscript(
-                    IFRAME(
-                        _src="%s/noscript?k=%s%s" % (
-                            server, public_key, error_param),
-                        _height="300", _width="500", _frameborder="0"), BR(),
-                    INPUT(
-                        _type='hidden', _name='recaptcha_response_field',
-                        _value='manual_challenge')), _id='recaptcha')
-
-        if not self.errors.captcha:
-            return XML(captcha).xml()
-        else:
-            captcha.append(DIV(self.errors['captcha'], _class='error'))
-            return XML(captcha).xml()
 
 
 class Recaptcha2(DIV):
@@ -1026,21 +899,21 @@ class Recaptcha2(DIV):
         if not recaptcha_response_field:
             self.errors['captcha'] = self.error_message
             return False
-        params = urllib.urlencode({
+        params = urlencode({
             'secret': self.private_key,
             'remoteip': remoteip,
             'response': recaptcha_response_field,
-        })
+        }).encode('utf-8')
         request = urllib2.Request(
             url=self.VERIFY_SERVER,
-            data=params,
+            data=to_bytes(params),
             headers={'Content-type': 'application/x-www-form-urlencoded',
                      'User-agent': 'reCAPTCHA Python'})
-        httpresp = urllib2.urlopen(request)
+        httpresp = urlopen(request)
         content = httpresp.read()
         httpresp.close()
         try:
-            response_dict = json.loads(content)
+            response_dict = json.loads(to_native(content))
         except:
             self.errors['captcha'] = self.error_message
             return False
@@ -1165,7 +1038,7 @@ class AuthJWT(object):
                              Example:
                              def mybefore_authorization(tokend):
                                  if not tokend['my_name_is'] == 'bond,james bond':
-                                     raise HTTP(400, u'Invalid JWT my_name_is claim')
+                                     raise HTTP(400, 'Invalid JWT my_name_is claim')
      - max_header_length: check max length to avoid load()ing unusually large tokens (could mean crafted, e.g. in a DDoS.)
 
     Basic Usage:
@@ -1289,7 +1162,7 @@ class AuthJWT(object):
         b64h, b64b = body.split(b'.', 1)
         if b64h != self.cached_b64h:
             # header not the same
-            raise HTTP(400, u'Invalid JWT Header')
+            raise HTTP(400, 'Invalid JWT Header')
         secret = self.secret_key
         tokend = serializers.loads_json(to_native(self.jwt_b64d(b64b)))
         if self.salt:
@@ -1300,11 +1173,11 @@ class AuthJWT(object):
         secret = to_bytes(secret, 'ascii', 'ignore')
         if not self.verify_signature(body, sig, secret):
             # signature verification failed
-            raise HTTP(400, u'Token signature is invalid')
+            raise HTTP(400, 'Token signature is invalid')
         if self.verify_expiration:
             now = time.mktime(datetime.datetime.utcnow().timetuple())
             if tokend['exp'] + self.leeway < now:
-                raise HTTP(400, u'Token is expired')
+                raise HTTP(400, 'Token is expired')
         if callable(self.before_authorization):
             self.before_authorization(tokend)
         return tokend
@@ -1320,7 +1193,7 @@ class AuthJWT(object):
         # is the following safe or should we use
         # calendar.timegm(datetime.datetime.utcnow().timetuple())
         # result seem to be the same (seconds since epoch, in UTC)
-        now = time.mktime(datetime.datetime.now().timetuple())
+        now = time.mktime(datetime.datetime.utcnow().timetuple())
         expires = now + self.expiration
         payload = dict(
             hmac_key=session_auth['hmac_key'],
@@ -1332,16 +1205,16 @@ class AuthJWT(object):
         return payload
 
     def refresh_token(self, orig_payload):
-        now = time.mktime(datetime.datetime.now().timetuple())
+        now = time.mktime(datetime.datetime.utcnow().timetuple())
         if self.verify_expiration:
             orig_exp = orig_payload['exp']
             if orig_exp + self.leeway < now:
                 # token already expired, can't be used for refresh
-                raise HTTP(400, u'Token already expired')
+                raise HTTP(400, 'Token already expired')
         orig_iat = orig_payload.get('orig_iat') or orig_payload['iat']
         if orig_iat + self.refresh_expiration_delta < now:
             # refreshed too long ago
-            raise HTTP(400, u'Token issued too long ago')
+            raise HTTP(400, 'Token issued too long ago')
         expires = now + self.expiration
         orig_payload.update(
             orig_iat=orig_iat,
@@ -1387,7 +1260,7 @@ class AuthJWT(object):
             pass
         if token:
             if not self.allow_refresh:
-                raise HTTP(403, u'Refreshing token is not allowed')
+                raise HTTP(403, 'Refreshing token is not allowed')
             tokend = self.load_token(token)
             # verification can fail here
             refreshed = self.refresh_token(tokend)
@@ -1405,9 +1278,9 @@ class AuthJWT(object):
             ret = {'token': self.generate_token(payload)}
         elif ret is None:
             raise HTTP(401,
-                       u'Not Authorized - need to be logged in, to pass a token '
-                       u'for refresh or username and password for login',
-                       **{'WWW-Authenticate': u'JWT realm="%s"' % self.realm})
+                       'Not Authorized - need to be logged in, to pass a token '
+                       'for refresh or username and password for login',
+                       **{'WWW-Authenticate': 'JWT realm="%s"' % self.realm})
         response.headers['Content-Type'] = 'application/json'
         return serializers.json(ret)
 
@@ -1431,14 +1304,16 @@ class AuthJWT(object):
         if token_in_header:
             parts = token_in_header.split()
             if parts[0].lower() != self.header_prefix.lower():
-                raise HTTP(400, u'Invalid JWT header')
+                raise HTTP(400, 'Invalid JWT header')
             elif len(parts) == 1:
-                raise HTTP(400, u'Invalid JWT header, missing token')
+                raise HTTP(400, 'Invalid JWT header, missing token')
             elif len(parts) > 2:
                 raise HTTP(400, 'Invalid JWT header, token contains spaces')
             token = parts[1]
         else:
             token = current.request.vars.get(token_param)
+            if token is None:
+                raise HTTP(400, 'JWT header not found and JWT parameter {} missing in request'.format(token_param))
 
         self.recvd_token = token
         return token
@@ -1504,6 +1379,7 @@ class Auth(AuthAPI):
                             login_after_password_change=True,
                             login_after_registration=False,
                             login_captcha=None,
+                            login_specify_error=False,
                             long_expiration=3600 * 30 * 24,  # one month
                             mailer=None,
                             manager_actions={},
@@ -1792,6 +1668,7 @@ class Auth(AuthAPI):
                              servicevalidate='serviceValidate',
                              proxyvalidate='proxyValidate',
                              logout='logout'),
+            cas_create_user=True,
             extra_fields={},
             actions_disabled=[],
             controller=controller,
@@ -1877,7 +1754,7 @@ class Auth(AuthAPI):
         # _next variable in the request.
         if next:
             parts = next.split('/')
-            if ':' not in parts[0]:
+            if ':' not in parts[0] and parts[:2] != ['', '']:
                 return next
             elif len(parts) > 2 and parts[0].endswith(':') and parts[1:3] == ['', host]:
                 return next
@@ -2284,10 +2161,14 @@ class Auth(AuthAPI):
         If the user doesn't yet exist, then they are created.
         """
         table_user = self.table_user()
+        create_user = self.settings.cas_create_user
         user = None
         checks = []
         # make a guess about who this user is
-        for fieldname in ['registration_id', 'username', 'email']:
+        guess_fields = ['registration_id', 'username', 'email']
+        if self.settings.login_userfield:
+            guess_fields.append(self.settings.login_userfield)
+        for fieldname in guess_fields:
             if fieldname in table_user.fields() and \
                     keys.get(fieldname, None):
                 checks.append(fieldname)
@@ -2316,6 +2197,11 @@ class Auth(AuthAPI):
                     update_keys[key] = keys[key]
             user.update_record(**update_keys)
         elif checks:
+            if create_user is False:
+                # Remove current open session a send message
+                self.logout(next=None, onlogout=None, log=None)
+                raise HTTP(403, "Forbidden. User need to be created first.")
+
             if 'first_name' not in keys and 'first_name' in table_user.fields:
                 guess = keys.get('email', 'anonymous').split('@')[0]
                 keys['first_name'] = keys.get('username', guess)
@@ -2358,16 +2244,16 @@ class Auth(AuthAPI):
         if basic_auth_realm:
             if callable(basic_auth_realm):
                 basic_auth_realm = basic_auth_realm()
-            elif isinstance(basic_auth_realm, (unicode, str)):
-                basic_realm = unicode(basic_auth_realm)  # Warning python 3.5 does not have method unicod
+            elif isinstance(basic_auth_realm, string_types):
+                basic_realm = to_unicode(basic_auth_realm)
             elif basic_auth_realm is True:
-                basic_realm = u'' + current.request.application
-            http_401 = HTTP(401, u'Not Authorized', **{'WWW-Authenticate': u'Basic realm="' + basic_realm + '"'})
+                basic_realm = '' + current.request.application
+            http_401 = HTTP(401, 'Not Authorized', **{'WWW-Authenticate': 'Basic realm="' + basic_realm + '"'})
         if not basic or not basic[:6].lower() == 'basic ':
             if basic_auth_realm:
                 raise http_401
             return (True, False, False)
-        (username, sep, password) = base64.b64decode(basic[6:]).partition(':')
+        (username, sep, password) = base64.b64decode(basic[6:]).partition(b':')
         is_valid_user = sep and self.login_bare(username, password)
         if not is_valid_user and basic_auth_realm:
             raise http_401
@@ -2375,8 +2261,9 @@ class Auth(AuthAPI):
 
     def _get_login_settings(self):
         table_user = self.table_user()
-        userfield = self.settings.login_userfield or 'username' \
-            if 'username' in table_user.fields else 'email'
+        userfield = self.settings.login_userfield or ('username' \
+            if self.settings.login_userfield or 'username' \
+            in table_user.fields else 'email')
         passfield = self.settings.password_field
         return Storage({'table_user': table_user,
                         'userfield': userfield,
@@ -2491,9 +2378,9 @@ class Auth(AuthAPI):
                 success = True
 
         def build_response(body):
-            return '<?xml version="1.0" encoding="UTF-8"?>\n' +\
-                TAG['cas:serviceResponse'](
-                    body, **{'_xmlns:cas': 'http://www.yale.edu/tp/cas'}).xml()
+            xml_body = to_native(TAG['cas:serviceResponse'](
+                    body, **{'_xmlns:cas': 'http://www.yale.edu/tp/cas'}).xml())
+            return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_body
         if success:
             if version == 1:
                 message = 'yes\n%s' % user[userfield]
@@ -2682,6 +2569,8 @@ class Auth(AuthAPI):
                            settings.formstyle, 'captcha__row')
                 accepted_form = False
 
+                specific_error = self.messages.invalid_user
+
                 if form.accepts(request, session if self.csrf_prevention else None,
                                 formname='login', dbio=False,
                                 onvalidation=onvalidation,
@@ -2697,6 +2586,7 @@ class Auth(AuthAPI):
                         user = table_user(**{username: entered_username})
                     if user:
                         # user in db, check if registration pending or disabled
+                        specific_error = self.messages.invalid_password
                         temp_user = user
                         if (temp_user.registration_key or '').startswith('pending'):
                             response.flash = self.messages.registration_pending
@@ -2746,11 +2636,9 @@ class Auth(AuthAPI):
                         self.log_event(self.messages['login_failed_log'],
                                        request.post_vars)
                         # invalid login
-                        session.flash = self.messages.invalid_login
+                        session.flash = specific_error if self.settings.login_specify_error else self.messages.invalid_login
                         callback(onfail, None)
-                        redirect(
-                            self.url(args=request.args, vars=request.get_vars),
-                            client_side=settings.client_side)
+                        redirect(self.url(args=request.args, vars=request.get_vars),client_side=settings.client_side)
 
             else:  # use a central authentication server
                 cas = settings.login_form
@@ -2863,7 +2751,7 @@ class Auth(AuthAPI):
 
                 auth.settings.auth_two_factor_enabled = True
                 auth.messages.two_factor_comment = "Verify your OTP Client for the code."
-                auth.settings.two_factor_methods = [lambda user, 
+                auth.settings.two_factor_methods = [lambda user,
                                                            auth_two_factor: _set_two_factor(user, auth_two_factor)]
                 auth.settings.two_factor_onvalidation = [lambda user, otp: verify_otp(user, otp)]
 
@@ -3044,7 +2932,7 @@ class Auth(AuthAPI):
 
         if self.settings.register_verify_password:
             if self.settings.register_fields is None:
-                self.settings.register_fields = [f.name for f in table_user if f.writable]
+                self.settings.register_fields = [f.name for f in table_user if f.writable and not f.compute]
                 k = self.settings.register_fields.index(passfield)
                 self.settings.register_fields.insert(k + 1, "password_two")
             extra_fields = [
@@ -3562,7 +3450,8 @@ class Auth(AuthAPI):
         if log is DEFAULT:
             log = self.messages['reset_password_log']
         userfield = self.settings.login_userfield or 'username' \
-            if 'username' in table_user.fields else 'email'
+            if self.settings.login_userfield or 'username' \
+            in table_user.fields else 'email'
         if userfield == 'email':
             table_user.email.requires = [
                 IS_EMAIL(error_message=self.messages.invalid_email),
@@ -3570,7 +3459,7 @@ class Auth(AuthAPI):
                          error_message=self.messages.invalid_email)]
             if not self.settings.email_case_sensitive:
                 table_user.email.requires.insert(0, IS_LOWER())
-        else:
+        elif userfield == 'username':
             table_user.username.requires = [
                 IS_IN_DB(self.db, table_user.username,
                          error_message=self.messages.invalid_username)]
@@ -3656,6 +3545,16 @@ class Auth(AuthAPI):
         if not self.is_logged_in():
             redirect(self.settings.login_url,
                      client_side=self.settings.client_side)
+
+        # Go to external link to change the password
+        if self.settings.login_form != self:
+            cas = self.settings.login_form
+            # To prevent error if change_password_url function is not defined in alternate login
+            if hasattr(cas, 'change_password_url'):
+                next = cas.change_password_url(next)
+                if next is not None:
+                    redirect(next)
+
         db = self.db
         table_user = self.table_user()
         s = db(table_user.id == self.user.id)
@@ -3674,9 +3573,10 @@ class Auth(AuthAPI):
         requires = table_user[passfield].requires
         if not isinstance(requires, (list, tuple)):
             requires = [requires]
-        requires = list(filter(lambda t: isinstance(t, CRYPT), requires))
+        requires = [t for t in requires if isinstance(t, CRYPT)]
         if requires:
-            requires[0].min_length = 0
+            requires[0] = CRYPT(**requires[0].__dict__) # Copy the existing CRYPT attributes
+            requires[0].min_length = 0 # But do not enforce minimum length for the old password
         form = SQLFORM.factory(
             Field('old_password', 'password', requires=requires,
                   label=self.messages.old_password),
@@ -3729,6 +3629,7 @@ class Auth(AuthAPI):
                      client_side=self.settings.client_side)
         passfield = self.settings.password_field
         table_user[passfield].writable = False
+        table_user['email'].writable = False
         request = current.request
         session = current.session
         if next is DEFAULT:
@@ -3739,6 +3640,7 @@ class Auth(AuthAPI):
             onaccept = self.settings.profile_onaccept
         if log is DEFAULT:
             log = self.messages['profile_log']
+
         form = SQLFORM(
             table_user,
             self.user.id,
@@ -3757,14 +3659,15 @@ class Auth(AuthAPI):
                         onvalidation=onvalidation,
                         hideerror=self.settings.hideerror):
             extra_fields = self.settings.extra_fields.get(self.settings.table_user_name, [])
-            if any(f.compute for f in extra_fields):
-                user = table_user[self.user.id]
-                self._update_session_user(user)
-            else:
-                self.user.update(table_user._filter_fields(form.vars))
-
-            session.flash = self.messages.profile_updated
-            self.log_event(log, self.user)
+            if not form.deleted:
+                if any(f.compute for f in extra_fields):
+                    user = table_user[self.user.id]
+                    self._update_session_user(user)
+                    self.update_groups()
+                else:
+                    self.user.update(table_user._filter_fields(form.vars))
+                session.flash = self.messages.profile_updated
+                self.log_event(log, self.user)
             callback(onaccept, form)
             if form.deleted:
                 return self.logout()
@@ -4711,7 +4614,6 @@ class Crud(object):  # pragma: no cover
                 results = None
         return form, results
 
-
 urllib2.install_opener(urllib2.build_opener(urllib2.HTTPCookieProcessor()))
 
 
@@ -4720,7 +4622,7 @@ def fetch(url, data=None, headers=None,
           user_agent='Mozilla/5.0'):
     headers = headers or {}
     if data is not None:
-        data = urllib.urlencode(data)
+        data = urlencode(data)
     if user_agent:
         headers['User-agent'] = user_agent
     headers['Cookie'] = ' '.join(
@@ -4729,7 +4631,7 @@ def fetch(url, data=None, headers=None,
         from google.appengine.api import urlfetch
     except ImportError:
         req = urllib2.Request(url, data, headers)
-        html = urllib2.urlopen(req).read()
+        html = urlopen(req).read()
     else:
         method = ((data is None) and urlfetch.GET) or urlfetch.POST
         while url is not None:
@@ -5035,7 +4937,7 @@ class Service(object):
             return f
         return _amfrpc3
 
-    def soap(self, name=None, returns=None, args=None, doc=None):
+    def soap(self, name=None, returns=None, args=None, doc=None, response_element_name=None):
         """
         Example:
             Use as::
@@ -5059,7 +4961,7 @@ class Service(object):
         """
 
         def _soap(f):
-            self.soap_procedures[name or f.__name__] = f, returns, args, doc
+            self.soap_procedures[name or f.__name__] = f, returns, args, doc, response_element_name
             return f
         return _soap
 
@@ -5097,7 +4999,7 @@ class Service(object):
             elif r and not isinstance(r, types.GeneratorType) and isinstance(r[0], (dict, Storage)):
                 import csv
                 writer = csv.writer(s)
-                writer.writerow(r[0].keys())
+                writer.writerow(list(r[0].keys()))
                 for line in r:
                     writer.writerow([none_exception(v)
                                      for v in line.values()])
@@ -5314,7 +5216,7 @@ class Service(object):
     def serve_xmlrpc(self):
         request = current.request
         response = current.response
-        services = self.xmlrpc_procedures.values()
+        services = list(self.xmlrpc_procedures.values())
         return response.xmlrpc(request, services)
 
     def serve_amfrpc(self, version=0):
@@ -5365,8 +5267,8 @@ class Service(object):
             prefix='pys',
             documentation=documentation,
             ns=True)
-        for method, (function, returns, args, doc) in iteritems(procedures):
-            dispatcher.register_function(method, function, returns, args, doc)
+        for method, (function, returns, args, doc, resp_elem_name) in iteritems(procedures):
+            dispatcher.register_function(method, function, returns, args, doc, resp_elem_name)
         if request.env.request_method == 'POST':
             fault = {}
             # Process normal Soap Operation
@@ -5669,7 +5571,7 @@ class PluginManager(object):
         return self.__dict__[key]
 
     def keys(self):
-        return self.__dict__.keys()
+        return list(self.__dict__.keys())
 
     def __contains__(self, key):
         return key in self.__dict__
@@ -5915,7 +5817,7 @@ class Wiki(object):
         settings.templates = templates
         settings.controller = controller
         settings.function = function
-        settings.groups = auth.user_groups.values() \
+        settings.groups = list(auth.user_groups.values()) \
             if groups is None else groups
 
         db = auth.db
@@ -6011,7 +5913,7 @@ class Wiki(object):
         if (auth.user and
             check_credentials(current.request, gae_login=False) and
             'wiki_editor' not in auth.user_groups.values() and
-                self.settings.groups == auth.user_groups.values()):
+                self.settings.groups == list(auth.user_groups.values())):
             group = db.auth_group(role='wiki_editor')
             gid = group.id if group else db.auth_group.insert(
                 role='wiki_editor')
